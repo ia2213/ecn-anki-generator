@@ -1,9 +1,10 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Header
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
-import io, re, os, math, uuid, subprocess, sys
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import io, re, os, math, uuid, subprocess, sys, json, shutil
 from datetime import date, timedelta
-from typing import Optional
+from typing import Optional, List
 from pathlib import Path
 
 try:
@@ -12,7 +13,7 @@ try:
 except ImportError:
     extract_pages = None
 
-app = FastAPI(title="ECN Anki Generator API", version="3.1.0")
+app = FastAPI(title="ECN Anki Generator API", version="4.0.0")
 
 frontend_url = os.getenv("FRONTEND_URL", "*")
 app.add_middleware(
@@ -22,17 +23,32 @@ app.add_middleware(
 )
 
 MAX_FILE_SIZE = 200 * 1024 * 1024
+ADMIN_SECRET = os.getenv("ADMIN_SECRET", "ecn-admin-2026")
+DATA_DIR = Path("/tmp/ecn_data")
+BOOKS_DIR = DATA_DIR / "books"
+CARDS_DIR = DATA_DIR / "cards"
+DRAFT_OUTPUTS = DATA_DIR / "drafts"
 OPENDRAFT_DIR = Path(os.getenv("OPENDRAFT_DIR", "/tmp/opendraft"))
-DRAFT_OUTPUTS = Path("/tmp/draft_outputs")
-DRAFT_OUTPUTS.mkdir(parents=True, exist_ok=True)
 
+for d in [DATA_DIR, BOOKS_DIR, CARDS_DIR, DRAFT_OUTPUTS]:
+    d.mkdir(parents=True, exist_ok=True)
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+def is_admin(authorization: Optional[str] = Header(default=None)) -> bool:
+    if authorization and authorization.replace("Bearer ", "") == ADMIN_SECRET:
+        return True
+    return False
+
+def require_admin(authorization: Optional[str] = Header(default=None)):
+    if not authorization or authorization.replace("Bearer ", "") != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Admin only")
 
 def classify_element(text, font_size):
     text = text.strip()
     if font_size >= 16: return "h1"
     elif font_size >= 13: return "h2"
     elif font_size >= 11: return "h3"
-    elif text.startswith(("•", "-", "→", "▸", "*", "·")): return "bullet"
+    elif text.startswith(("•","-","→","▸","*","·")): return "bullet"
     elif re.match(r'^\d+\.\s', text): return "numbered_list"
     elif text.endswith(":") and len(text) < 80: return "label"
     else: return "paragraph"
@@ -50,11 +66,10 @@ def extract_pdf_structure(pdf_bytes):
                 for line in element:
                     for char in line:
                         if isinstance(char, LTChar):
-                            font_size = char.size
-                            break
+                            font_size = char.size; break
                     break
                 elem_type = classify_element(text, font_size)
-                if elem_type in ("h1", "h2", "h3"): current_section = text
+                if elem_type in ("h1","h2","h3"): current_section = text
                 elements.append({"type": elem_type, "content": text, "parent_section": current_section})
     return elements
 
@@ -62,20 +77,18 @@ def generate_anki_cards(elements):
     cards, current_title, bullet_buffer = [], None, []
     def flush_bullets():
         if current_title and len(bullet_buffer) >= 2:
-            cards.append({"type": "list", "question": f"Quels sont les éléments de : {current_title} ?", "answer": "\n".join(f"• {b}" for b in bullet_buffer)})
+            cards.append({"type":"list","question":f"Quels sont les éléments de : {current_title} ?","answer":"\n".join(f"• {b}" for b in bullet_buffer)})
             for bullet in bullet_buffer:
                 words = bullet.split()
                 if len(words) >= 3:
                     key_word = max(words, key=len)
-                    cloze = bullet.replace(key_word, "{{c1::" + key_word + "}}")
-                    cards.append({"type": "cloze", "question": f"[{current_title}] " + cloze, "answer": key_word})
+                    cloze = bullet.replace(key_word, "{{c1::"+key_word+"}}")
+                    cards.append({"type":"cloze","question":f"[{current_title}] "+cloze,"answer":key_word})
     for elem in elements:
-        if elem["type"] in ("h1", "h2", "h3"):
-            flush_bullets(); bullet_buffer = []; current_title = elem["content"]
-        elif elem["type"] in ("bullet", "numbered_list"):
-            bullet_buffer.append(elem["content"])
-        elif elem["type"] == "paragraph" and current_title and len(elem["content"]) > 60:
-            cards.append({"type": "qa", "question": f"[{current_title}] Complétez : {elem['content'][:80]}...", "answer": elem["content"]})
+        if elem["type"] in ("h1","h2","h3"): flush_bullets(); bullet_buffer=[]; current_title=elem["content"]
+        elif elem["type"] in ("bullet","numbered_list"): bullet_buffer.append(elem["content"])
+        elif elem["type"]=="paragraph" and current_title and len(elem["content"])>60:
+            cards.append({"type":"qa","question":f"[{current_title}] Complétez : {elem['content'][:80]}...","answer":elem["content"]})
     flush_bullets()
     return cards
 
@@ -86,81 +99,100 @@ def compute_study_plan(total_cards, target_date_str, cards_per_day):
     days_available = max((target - today).days, 1)
     if cards_per_day and cards_per_day > 0:
         cpd = cards_per_day; days_needed = math.ceil(total_cards / cpd)
-        completion_date = (today + timedelta(days=days_needed)).isoformat()
-        on_track = days_needed <= days_available
+        completion_date = (today + timedelta(days=days_needed)).isoformat(); on_track = days_needed <= days_available
     else:
-        cpd = math.ceil(total_cards / days_available); days_needed = days_available
-        completion_date = target.isoformat(); on_track = True
-    DAYS_FR = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"]
-    weights = [1.2, 1.2, 1.2, 1.2, 1.2, 0.6, 0.4]; tw = sum(weights)
-    weekly_schedule = [{"day": DAYS_FR[i], "cards": max(1, round(cpd * 7 * weights[i] / tw))} for i in range(7)]
+        cpd = math.ceil(total_cards / days_available); days_needed = days_available; completion_date = target.isoformat(); on_track = True
+    DAYS_FR = ["Lundi","Mardi","Mercredi","Jeudi","Vendredi","Samedi","Dimanche"]
+    weights = [1.2,1.2,1.2,1.2,1.2,0.6,0.4]; tw = sum(weights)
+    weekly_schedule = [{"day":DAYS_FR[i],"cards":max(1,round(cpd*7*weights[i]/tw))} for i in range(7)]
     phases = []
     if days_available >= 30:
-        p1 = today + timedelta(days=int(days_available * 0.5)); p2 = today + timedelta(days=int(days_available * 0.8))
+        p1 = today+timedelta(days=int(days_available*0.5)); p2 = today+timedelta(days=int(days_available*0.8))
         phases = [
-            {"name": "Phase 1 — Acquisition", "period": f"{today.isoformat()} → {p1.isoformat()}", "new_cards_per_day": round(cpd * 0.7), "review_cards_per_day": round(cpd * 0.3), "tip": "Apprendre de nouveaux contenus, limiter les révisions."},
-            {"name": "Phase 2 — Consolidation", "period": f"{p1.isoformat()} → {p2.isoformat()}", "new_cards_per_day": round(cpd * 0.3), "review_cards_per_day": round(cpd * 0.7), "tip": "Réduire les nouvelles cartes, augmenter les révisions espacées."},
-            {"name": "Phase 3 — Révision intensive", "period": f"{p2.isoformat()} → {target.isoformat()}", "new_cards_per_day": 0, "review_cards_per_day": cpd, "tip": "100% révisions, aucune nouvelle carte."},
+            {"name":"Phase 1 — Acquisition","period":f"{today.isoformat()} → {p1.isoformat()}","new_cards_per_day":round(cpd*0.7),"review_cards_per_day":round(cpd*0.3),"tip":"Apprendre de nouveaux contenus."},
+            {"name":"Phase 2 — Consolidation","period":f"{p1.isoformat()} → {p2.isoformat()}","new_cards_per_day":round(cpd*0.3),"review_cards_per_day":round(cpd*0.7),"tip":"Révisions espacées."},
+            {"name":"Phase 3 — Révision intensive","period":f"{p2.isoformat()} → {target.isoformat()}","new_cards_per_day":0,"review_cards_per_day":cpd,"tip":"100% révisions."},
         ]
     else:
-        phases = [{"name": "Révision accélérée", "period": f"{today.isoformat()} → {target.isoformat()}", "new_cards_per_day": round(cpd * 0.4), "review_cards_per_day": round(cpd * 0.6), "tip": "Délai court — priorisez les cartes importantes."}]
-    return {"total_cards": total_cards, "target_date": target.isoformat(), "days_available": days_available, "cards_per_day": cpd, "days_needed": days_needed, "estimated_completion": completion_date, "on_track": on_track, "weekly_schedule": weekly_schedule, "phases": phases, "anki_settings": {"new_cards_per_day": round(cpd * 0.4), "reviews_per_day": round(cpd * 0.6), "tip": f"Anki : Nouvelles={round(cpd * 0.4)} Révisions={round(cpd * 0.6)}"}}
+        phases = [{"name":"Révision accélérée","period":f"{today.isoformat()} → {target.isoformat()}","new_cards_per_day":round(cpd*0.4),"review_cards_per_day":round(cpd*0.6),"tip":"Délai court."}]
+    return {"total_cards":total_cards,"target_date":target.isoformat(),"days_available":days_available,"cards_per_day":cpd,"days_needed":days_needed,"estimated_completion":completion_date,"on_track":on_track,"weekly_schedule":weekly_schedule,"phases":phases,"anki_settings":{"new_cards_per_day":round(cpd*0.4),"reviews_per_day":round(cpd*0.6),"tip":f"Anki : Nouvelles={round(cpd*0.4)} Révisions={round(cpd*0.6)}"}}
 
-def extract_topic_from_pdf(elements):
-    for elem in elements:
-        if elem["type"] in ("h1", "h2") and len(elem["content"]) > 5:
-            return elem["content"][:200]
-    for elem in elements:
-        if elem["type"] == "paragraph" and len(elem["content"]) > 20:
-            return elem["content"][:200]
-    return "Medical Research Topic"
+def slugify(text):
+    return re.sub(r'[^\w]+','_', text.lower().strip())[:40]
 
-def ensure_opendraft():
-    if not OPENDRAFT_DIR.exists():
-        subprocess.run(["git", "clone", "--depth=1", "https://github.com/federicodeponte/opendraft.git", str(OPENDRAFT_DIR)], check=True, capture_output=True, timeout=120)
-        subprocess.run([sys.executable, "-m", "pip", "install", "-r", str(OPENDRAFT_DIR / "requirements.txt"), "-q"], check=True, capture_output=True, timeout=300)
-
-def run_opendraft_background(draft_id: str, topic: str, language: str, level: str, user_gemini_key: Optional[str]):
-    out_dir = DRAFT_OUTPUTS / draft_id
-    out_dir.mkdir(parents=True, exist_ok=True)
-    status_file = out_dir / "status.json"
-    import json
-    status_file.write_text(json.dumps({"status": "running", "topic": topic}))
-    previous_key = os.environ.get("GOOGLE_API_KEY")
-    try:
-        ensure_opendraft()
-        if user_gemini_key:
-            os.environ["GOOGLE_API_KEY"] = user_gemini_key
-        if str(OPENDRAFT_DIR) not in sys.path:
-            sys.path.insert(0, str(OPENDRAFT_DIR))
-            sys.path.insert(0, str(OPENDRAFT_DIR / "engine"))
-        os.chdir(str(OPENDRAFT_DIR))
-        from engine.draft_generator import generate_draft
-        pdf_path, docx_path = generate_draft(
-            topic=topic,
-            language=language,
-            academic_level=level,
-            output_dir=out_dir / "draft",
-            skip_validation=True,
-            verbose=False,
-        )
-        status_file.write_text(json.dumps({"status": "done", "topic": topic, "pdf": str(pdf_path), "docx": str(docx_path)}))
-    except Exception as e:
-        status_file.write_text(json.dumps({"status": "error", "error": str(e)[:500]}))
-    finally:
-        if previous_key is not None:
-            os.environ["GOOGLE_API_KEY"] = previous_key
-        elif "GOOGLE_API_KEY" in os.environ:
-            del os.environ["GOOGLE_API_KEY"]
-
+# ── ROUTES BASE ──────────────────────────────────────────────────────────────
 @app.get("/")
-def root():
-    return {"message": "ECN Anki Generator API v3.1", "status": "running", "max_file_mb": 200}
+def root(): return {"message":"ECN Anki Generator API v4","status":"running"}
 
 @app.get("/health")
-def health():
-    return {"status": "ok"}
+def health(): return {"status":"ok"}
 
+# ── ADMIN: upload book ─────────────────────────────────────────────────────
+@app.post("/admin/books")
+async def admin_upload_book(
+    file: UploadFile = File(...),
+    title: Optional[str] = None,
+    category: Optional[str] = "Général",
+    authorization: Optional[str] = Header(default=None),
+):
+    require_admin(authorization)
+    if not file.filename.endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="PDF uniquement")
+    content = await file.read()
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=413, detail="Fichier trop volumineux")
+    book_id = str(uuid.uuid4())
+    book_title = title or file.filename.replace(".pdf","")
+    book_dir = BOOKS_DIR / book_id
+    book_dir.mkdir()
+    (book_dir/"original.pdf").write_bytes(content)
+    elements = extract_pdf_structure(content)
+    cards = generate_anki_cards(elements)
+    for i,c in enumerate(cards): c["id"] = f"{book_id}_{i}"; c["book_id"] = book_id
+    (book_dir/"cards.json").write_text(json.dumps(cards, ensure_ascii=False))
+    meta = {"id":book_id,"title":book_title,"category":category,"filename":file.filename,"cards_count":len(cards),"created_at":date.today().isoformat()}
+    (book_dir/"meta.json").write_text(json.dumps(meta, ensure_ascii=False))
+    index = json.loads((BOOKS_DIR/"index.json").read_text()) if (BOOKS_DIR/"index.json").exists() else []
+    index.append(meta)
+    (BOOKS_DIR/"index.json").write_text(json.dumps(index, ensure_ascii=False))
+    return meta
+
+@app.delete("/admin/books/{book_id}")
+def admin_delete_book(book_id: str, authorization: Optional[str] = Header(default=None)):
+    require_admin(authorization)
+    book_dir = BOOKS_DIR / book_id
+    if not book_dir.exists(): raise HTTPException(status_code=404, detail="Livre introuvable")
+    shutil.rmtree(book_dir)
+    index = json.loads((BOOKS_DIR/"index.json").read_text()) if (BOOKS_DIR/"index.json").exists() else []
+    index = [b for b in index if b["id"] != book_id]
+    (BOOKS_DIR/"index.json").write_text(json.dumps(index, ensure_ascii=False))
+    return {"deleted":book_id}
+
+# ── PUBLIC: library & cards ───────────────────────────────────────────────
+@app.get("/library")
+def get_library():
+    if not (BOOKS_DIR/"index.json").exists(): return []
+    return json.loads((BOOKS_DIR/"index.json").read_text())
+
+@app.get("/library/{book_id}/cards")
+def get_book_cards(book_id: str):
+    cards_file = BOOKS_DIR / book_id / "cards.json"
+    if not cards_file.exists(): raise HTTPException(status_code=404, detail="Livre introuvable")
+    return json.loads(cards_file.read_text())
+
+@app.get("/library/all-cards")
+def get_all_cards(category: Optional[str] = None):
+    if not (BOOKS_DIR/"index.json").exists(): return []
+    index = json.loads((BOOKS_DIR/"index.json").read_text())
+    all_cards = []
+    for book in index:
+        if category and book.get("category") != category: continue
+        cards_file = BOOKS_DIR / book["id"] / "cards.json"
+        if cards_file.exists():
+            all_cards.extend(json.loads(cards_file.read_text()))
+    return all_cards
+
+# ── PARSE PDF (personal upload, unchanged) ───────────────────────────────
 @app.post("/parse-pdf")
 async def parse_pdf(
     background_tasks: BackgroundTasks,
@@ -172,65 +204,55 @@ async def parse_pdf(
     draft_level: str = "research_paper",
     x_gemini_api_key: Optional[str] = Header(default=None),
 ):
-    if not file.filename.endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Seuls les fichiers PDF sont acceptés")
+    if not file.filename.endswith(".pdf"): raise HTTPException(status_code=400, detail="PDF uniquement")
     content = await file.read()
-    if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=413, detail="Fichier trop volumineux (max 200MB)")
+    if len(content) > MAX_FILE_SIZE: raise HTTPException(status_code=413, detail="Fichier trop volumineux")
     try:
         elements = extract_pdf_structure(content)
         cards = generate_anki_cards(elements)
         study_plan = compute_study_plan(len(cards), target_date, cards_per_day)
-        draft_id = None
-        draft_topic = None
+        draft_id = None; draft_topic = None
         if generate_academic_draft:
-            if not x_gemini_api_key:
-                raise HTTPException(status_code=400, detail="Ajoutez votre clé Gemini personnelle pour générer le draft académique")
-            draft_topic = extract_topic_from_pdf(elements)
+            if not x_gemini_api_key: raise HTTPException(status_code=400, detail="Clé Gemini requise")
+            draft_topic = next((e["content"][:200] for e in elements if e["type"] in ("h1","h2") and len(e["content"])>5), "Medical Topic")
             draft_id = str(uuid.uuid4())
-            background_tasks.add_task(run_opendraft_background, draft_id, draft_topic, draft_language, draft_level, x_gemini_api_key)
-        return JSONResponse({
-            "filename": file.filename,
-            "elements_count": len(elements),
-            "cards_count": len(cards),
-            "cards": cards,
-            "study_plan": study_plan,
-            "draft_id": draft_id,
-            "draft_topic": draft_topic,
-        })
-    except HTTPException:
-        raise
+            background_tasks.add_task(_run_opendraft, draft_id, draft_topic, draft_language, draft_level, x_gemini_api_key)
+        return JSONResponse({"filename":file.filename,"elements_count":len(elements),"cards_count":len(cards),"cards":cards,"study_plan":study_plan,"draft_id":draft_id,"draft_topic":draft_topic})
+    except HTTPException: raise
+    except Exception as e: raise HTTPException(status_code=500, detail=f"Erreur: {str(e)}")
+
+def _run_opendraft(draft_id, topic, language, level, gemini_key):
+    out_dir = DRAFT_OUTPUTS / draft_id; out_dir.mkdir(parents=True, exist_ok=True)
+    sf = out_dir / "status.json"; sf.write_text(json.dumps({"status":"running","topic":topic}))
+    prev = os.environ.get("GOOGLE_API_KEY")
+    try:
+        if not (Path("/tmp/opendraft")).exists():
+            subprocess.run(["git","clone","--depth=1","https://github.com/federicodeponte/opendraft.git","/tmp/opendraft"],check=True,capture_output=True,timeout=120)
+            subprocess.run([sys.executable,"-m","pip","install","-r","/tmp/opendraft/requirements.txt","-q"],check=True,capture_output=True,timeout=300)
+        os.environ["GOOGLE_API_KEY"] = gemini_key
+        if "/tmp/opendraft" not in sys.path: sys.path.insert(0,"/tmp/opendraft"); sys.path.insert(0,"/tmp/opendraft/engine")
+        os.chdir("/tmp/opendraft")
+        from engine.draft_generator import generate_draft
+        pdf_path, docx_path = generate_draft(topic=topic,language=language,academic_level=level,output_dir=out_dir/"draft",skip_validation=True,verbose=False)
+        sf.write_text(json.dumps({"status":"done","topic":topic,"pdf":str(pdf_path),"docx":str(docx_path)}))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erreur parsing: {str(e)}")
+        sf.write_text(json.dumps({"status":"error","error":str(e)[:500]}))
+    finally:
+        if prev is not None: os.environ["GOOGLE_API_KEY"] = prev
+        elif "GOOGLE_API_KEY" in os.environ: del os.environ["GOOGLE_API_KEY"]
 
 @app.get("/draft-status/{draft_id}")
 def draft_status(draft_id: str):
-    import json
-    status_file = DRAFT_OUTPUTS / draft_id / "status.json"
-    if not status_file.exists():
-        raise HTTPException(status_code=404, detail="Draft introuvable")
-    return json.loads(status_file.read_text())
+    sf = DRAFT_OUTPUTS / draft_id / "status.json"
+    if not sf.exists(): raise HTTPException(status_code=404)
+    return json.loads(sf.read_text())
 
-@app.get("/draft-download/{draft_id}/{format}")
-def draft_download(draft_id: str, format: str):
-    import json
-    status_file = DRAFT_OUTPUTS / draft_id / "status.json"
-    if not status_file.exists():
-        raise HTTPException(status_code=404, detail="Draft introuvable")
-    data = json.loads(status_file.read_text())
-    if data.get("status") != "done":
-        raise HTTPException(status_code=400, detail="Draft pas encore prêt")
-    if format == "pdf":
-        path = Path(data["pdf"])
-        return FileResponse(path, media_type="application/pdf", filename=path.name)
-    if format == "docx":
-        path = Path(data["docx"])
-        return FileResponse(path, media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", filename=path.name)
-    raise HTTPException(status_code=400, detail="Format invalide (pdf ou docx)")
-
-@app.post("/study-plan")
-async def create_study_plan(payload: dict):
-    total_cards = payload.get("total_cards", 0)
-    if total_cards <= 0:
-        raise HTTPException(status_code=400, detail="total_cards doit être > 0")
-    return compute_study_plan(total_cards, payload.get("target_date"), payload.get("cards_per_day"))
+@app.get("/draft-download/{draft_id}/{fmt}")
+def draft_download(draft_id: str, fmt: str):
+    sf = DRAFT_OUTPUTS / draft_id / "status.json"
+    if not sf.exists(): raise HTTPException(status_code=404)
+    data = json.loads(sf.read_text())
+    if data.get("status") != "done": raise HTTPException(status_code=400, detail="Pas encore prêt")
+    if fmt == "pdf": path = Path(data["pdf"]); return FileResponse(path, media_type="application/pdf", filename=path.name)
+    if fmt == "docx": path = Path(data["docx"]); return FileResponse(path, media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", filename=path.name)
+    raise HTTPException(status_code=400, detail="Format invalide")
