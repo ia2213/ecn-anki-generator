@@ -1,0 +1,10 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root { --foreground-rgb: 15, 23, 42; }
+body { color: rgb(var(--foreground-rgb)); background: #f8fafc; }
+
+@layer utilities {
+  .card-hover { @apply transition-all duration-200 hover:shadow-lg hover:-translate-y-0.5; }
+}
